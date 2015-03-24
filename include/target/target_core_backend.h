@@ -111,6 +111,7 @@ void	array_free(void *array, int n);
 void	target_core_setup_sub_cits(struct se_subsystem_api *);
 
 /* attribute helpers from target_core_device.c for backend drivers */
+bool	se_dev_check_wce(struct se_device *);
 int	se_dev_set_max_unmap_lba_count(struct se_device *, u32);
 int	se_dev_set_max_unmap_block_desc_count(struct se_device *, u32);
 int	se_dev_set_unmap_granularity(struct se_device *, u32);
@@ -135,7 +136,6 @@ int	se_dev_set_is_nonrot(struct se_device *, int);
 int	se_dev_set_emulate_rest_reord(struct se_device *dev, int);
 int	se_dev_set_queue_depth(struct se_device *, u32);
 int	se_dev_set_max_sectors(struct se_device *, u32);
-int	se_dev_set_fabric_max_sectors(struct se_device *, u32);
 int	se_dev_set_optimal_sectors(struct se_device *, u32);
 int	se_dev_set_block_size(struct se_device *, u32);
 

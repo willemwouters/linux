@@ -650,6 +650,18 @@ static u32 se_dev_align_max_sectors(u32 max_sectors, u32 block_size)
 	return aligned_max_sectors;
 }
 
+bool se_dev_check_wce(struct se_device *dev)
+{
+	bool wce = false;
+
+	if (dev->transport->get_write_cache)
+		wce = dev->transport->get_write_cache(dev);
+	else if (dev->dev_attrib.emulate_write_cache > 0)
+		wce = true;
+
+	return wce;
+}
+
 int se_dev_set_max_unmap_lba_count(
 	struct se_device *dev,
 	u32 max_unmap_lba_count)
@@ -767,6 +779,16 @@ int se_dev_set_emulate_fua_write(struct se_device *dev, int flag)
 		pr_err("Illegal value %d\n", flag);
 		return -EINVAL;
 	}
+	if (flag &&
+	    dev->transport->get_write_cache) {
+		pr_err("emulate_fua_write not supported for this device\n");
+		return -EINVAL;
+	}
+	if (dev->export_count) {
+		pr_err("emulate_fua_write cannot be changed with active"
+		       " exports: %d\n", dev->export_count);
+		return -EINVAL;
+	}
 	dev->dev_attrib.emulate_fua_write = flag;
 	pr_debug("dev[%p]: SE Device Forced Unit Access WRITEs: %d\n",
 			dev, dev->dev_attrib.emulate_fua_write);
@@ -801,7 +823,11 @@ int se_dev_set_emulate_write_cache(struct se_device *dev, int flag)
 		pr_err("emulate_write_cache not supported for this device\n");
 		return -EINVAL;
 	}
-
+	if (dev->export_count) {
+		pr_err("emulate_write_cache cannot be changed with active"
+		       " exports: %d\n", dev->export_count);
+		return -EINVAL;
+	}
 	dev->dev_attrib.emulate_write_cache = flag;
 	pr_debug("dev[%p]: SE Device WRITE_CACHE_EMULATION flag: %d\n",
 			dev, dev->dev_attrib.emulate_write_cache);
@@ -1103,51 +1129,6 @@ int se_dev_set_queue_depth(struct se_device *dev, u32 queue_depth)
 }
 EXPORT_SYMBOL(se_dev_set_queue_depth);
 
-int se_dev_set_fabric_max_sectors(struct se_device *dev, u32 fabric_max_sectors)
-{
-	int block_size = dev->dev_attrib.block_size;
-
-	if (dev->export_count) {
-		pr_err("dev[%p]: Unable to change SE Device"
-			" fabric_max_sectors while export_count is %d\n",
-			dev, dev->export_count);
-		return -EINVAL;
-	}
-	if (!fabric_max_sectors) {
-		pr_err("dev[%p]: Illegal ZERO value for"
-			" fabric_max_sectors\n", dev);
-		return -EINVAL;
-	}
-	if (fabric_max_sectors < DA_STATUS_MAX_SECTORS_MIN) {
-		pr_err("dev[%p]: Passed fabric_max_sectors: %u less than"
-			" DA_STATUS_MAX_SECTORS_MIN: %u\n", dev, fabric_max_sectors,
-				DA_STATUS_MAX_SECTORS_MIN);
-		return -EINVAL;
-	}
-	if (fabric_max_sectors > DA_STATUS_MAX_SECTORS_MAX) {
-		pr_err("dev[%p]: Passed fabric_max_sectors: %u"
-			" greater than DA_STATUS_MAX_SECTORS_MAX:"
-			" %u\n", dev, fabric_max_sectors,
-			DA_STATUS_MAX_SECTORS_MAX);
-		return -EINVAL;
-	}
-	/*
-	 * Align max_sectors down to PAGE_SIZE to follow transport_allocate_data_tasks()
-	 */
-	if (!block_size) {
-		block_size = 512;
-		pr_warn("Defaulting to 512 for zero block_size\n");
-	}
-	fabric_max_sectors = se_dev_align_max_sectors(fabric_max_sectors,
-						      block_size);
-
-	dev->dev_attrib.fabric_max_sectors = fabric_max_sectors;
-	pr_debug("dev[%p]: SE Device max_sectors changed to %u\n",
-			dev, fabric_max_sectors);
-	return 0;
-}
-EXPORT_SYMBOL(se_dev_set_fabric_max_sectors);
-
 int se_dev_set_optimal_sectors(struct se_device *dev, u32 optimal_sectors)
 {
 	if (dev->export_count) {
@@ -1156,10 +1137,10 @@ int se_dev_set_optimal_sectors(struct se_device *dev, u32 optimal_sectors)
 			dev, dev->export_count);
 		return -EINVAL;
 	}
-	if (optimal_sectors > dev->dev_attrib.fabric_max_sectors) {
+	if (optimal_sectors > dev->dev_attrib.hw_max_sectors) {
 		pr_err("dev[%p]: Passed optimal_sectors %u cannot be"
-			" greater than fabric_max_sectors: %u\n", dev,
-			optimal_sectors, dev->dev_attrib.fabric_max_sectors);
+			" greater than hw_max_sectors: %u\n", dev,
+			optimal_sectors, dev->dev_attrib.hw_max_sectors);
 		return -EINVAL;
 	}
 
@@ -1553,8 +1534,6 @@ struct se_device *target_alloc_device(struct se_hba *hba, const char *name)
 	dev->dev_attrib.unmap_granularity_alignment =
 				DA_UNMAP_GRANULARITY_ALIGNMENT_DEFAULT;
 	dev->dev_attrib.max_write_same_len = DA_MAX_WRITE_SAME_LEN;
-	dev->dev_attrib.fabric_max_sectors = DA_FABRIC_MAX_SECTORS;
-	dev->dev_attrib.optimal_sectors = DA_FABRIC_MAX_SECTORS;
 
 	xcopy_lun = &dev->xcopy_lun;
 	xcopy_lun->lun_se_dev = dev;
@@ -1581,8 +1560,6 @@ int target_configure_device(struct se_device *dev)
 	ret = dev->transport->configure_device(dev);
 	if (ret)
 		goto out;
-	dev->dev_flags |= DF_CONFIGURED;
-
 	/*
 	 * XXX: there is not much point to have two different values here..
 	 */
@@ -1595,6 +1572,7 @@ int target_configure_device(struct se_device *dev)
 	dev->dev_attrib.hw_max_sectors =
 		se_dev_align_max_sectors(dev->dev_attrib.hw_max_sectors,
 					 dev->dev_attrib.hw_block_size);
+	dev->dev_attrib.optimal_sectors = dev->dev_attrib.hw_max_sectors;
 
 	dev->dev_index = scsi_get_new_index(SCSI_DEVICE_INDEX);
 	dev->creation_time = get_jiffies_64();
@@ -1642,6 +1620,8 @@ int target_configure_device(struct se_device *dev)
 	mutex_lock(&g_device_mutex);
 	list_add_tail(&dev->g_dev_node, &g_device_list);
 	mutex_unlock(&g_device_mutex);
+
+	dev->dev_flags |= DF_CONFIGURED;
 
 	return 0;
 
